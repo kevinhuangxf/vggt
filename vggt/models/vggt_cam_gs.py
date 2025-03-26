@@ -9,13 +9,13 @@ class VGGT_CAM_GS(VGGT):
     specific to the CAM (Class Activation Map) and GS (Gradient-based Saliency).
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, down_ratio=1, *args, **kwargs):
         """
         Initialize the VGGT_CAM_GS class by calling the parent VGGT class constructor.
         """
         super().__init__(*args, **kwargs)
         # self.gs_head = DPTHead(dim_in=2 * kwargs['embed_dim'], output_dim=14, activation="exp", conf_activation="expp1")
-        self.gs_head = GSHead(dim_in=2 * kwargs['embed_dim'], output_dim=14, activation="exp", conf_activation="expp1", down_ratio=2)
+        self.gs_head = GSHead(dim_in=2 * kwargs['embed_dim'], output_dim=14, activation="exp", conf_activation="expp1", down_ratio=down_ratio)
 
 
     def generate_cam(self, inputs):

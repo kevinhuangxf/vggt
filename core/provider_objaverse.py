@@ -9,10 +9,13 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 
+import PIL
+import trimesh
 from PIL import Image
 
 import kiui
-from kiui.cam import orbit_camera
+from kiui.cam import orbit_camera, OrbitCamera
+
 from core.options import Options
 from core.utils import get_rays, grid_distortion, orbit_camera_jitter
 
@@ -31,19 +34,94 @@ import json
 # kiui_uids = pd.read_csv("/workspace/code/objaverse_filter/kiuisobj_v1_merged_80K.csv", header=None)
 # uids = kiui_uids[1].values.tolist()
 
+os.environ["OPENCV_IO_ENABLE_OPENEXR"]="1"
 
-def normalize_point_cloud(point_cloud: torch.Tensor, box_scale: float):
+# def normalize_point_cloud(point_cloud: torch.Tensor, box_scale: float):
+#     # Assuming point_cloud is a tensor of shape (N, 3) where N is the number of points
+#     bbox_min, bbox_max = torch.min(point_cloud, dim=0)[0], torch.max(point_cloud, dim=0)[0]
+#     scale = box_scale / torch.max(bbox_max - bbox_min)
+#     # Scale the point cloud
+#     point_cloud *= scale
+#     # Recompute the bounding box
+#     bbox_min, bbox_max = torch.min(point_cloud, dim=0)[0], torch.max(point_cloud, dim=0)[0]
+#     offset = -(bbox_min + bbox_max) / 2
+#     # Translate the point cloud
+#     point_cloud += offset
+#     return point_cloud
+
+
+def normalize_point_cloud(point_cloud, box_scale):
     # Assuming point_cloud is a tensor of shape (N, 3) where N is the number of points
-    bbox_min, bbox_max = torch.min(point_cloud, dim=0)[0], torch.max(point_cloud, dim=0)[0]
-    scale = box_scale / torch.max(bbox_max - bbox_min)
+    bbox_min, bbox_max = np.min(point_cloud, axis=0), np.max(point_cloud, axis=0)
+    scale = box_scale / np.max(bbox_max - bbox_min)
     # Scale the point cloud
     point_cloud *= scale
     # Recompute the bounding box
-    bbox_min, bbox_max = torch.min(point_cloud, dim=0)[0], torch.max(point_cloud, dim=0)[0]
+    bbox_min, bbox_max = np.min(point_cloud, axis=0), np.max(point_cloud, axis=0)
     offset = -(bbox_min + bbox_max) / 2
     # Translate the point cloud
     point_cloud += offset
+
     return point_cloud
+
+
+def depthmap_to_camera_coordinates(depthmap, camera_intrinsics, pseudo_focal=None):
+    """
+    Args:
+        - depthmap (HxW array):
+        - camera_intrinsics: a 3x3 matrix
+    Returns:
+        pointmap of absolute coordinates (HxWx3 array), and a mask specifying valid pixels.
+    """
+    camera_intrinsics = np.float32(camera_intrinsics)
+    H, W = depthmap.shape
+
+    # Compute 3D ray associated with each pixel
+    # Strong assumption: there are no skew terms
+    assert camera_intrinsics[0, 1] == 0.0
+    assert camera_intrinsics[1, 0] == 0.0
+    if pseudo_focal is None:
+        fu = camera_intrinsics[0, 0]
+        fv = camera_intrinsics[1, 1]
+    else:
+        assert pseudo_focal.shape == (H, W)
+        fu = fv = pseudo_focal
+    cu = camera_intrinsics[0, 2]
+    cv = camera_intrinsics[1, 2]
+
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    z_cam = depthmap
+    x_cam = (u - cu) * z_cam / fu
+    y_cam = (v - cv) * z_cam / fv
+    X_cam = np.stack((x_cam, y_cam, z_cam), axis=-1).astype(np.float32)
+
+    # Mask for valid coordinates
+    valid_mask = (depthmap > 0.0)
+    # valid_mask = (depthmap >= 0.0)
+    return X_cam, valid_mask
+
+
+def depthmap_to_absolute_camera_coordinates(depthmap, camera_intrinsics, camera_pose, **kw):
+    """
+    Args:
+        - depthmap (HxW array):
+        - camera_intrinsics: a 3x3 matrix
+        - camera_pose: a 4x3 or 4x4 cam2world matrix
+    Returns:
+        pointmap of absolute coordinates (HxWx3 array), and a mask specifying valid pixels."""
+    X_cam, valid_mask = depthmap_to_camera_coordinates(depthmap, camera_intrinsics)
+
+    X_world = X_cam # default
+    if camera_pose is not None:
+        # R_cam2world = np.float32(camera_params["R_cam2world"])
+        # t_cam2world = np.float32(camera_params["t_cam2world"]).squeeze()
+        R_cam2world = camera_pose[:3, :3]
+        t_cam2world = camera_pose[:3, 3]
+
+        # Express in absolute coordinates (invalid depth values)
+        X_world = np.einsum("ik, vuk -> vui", R_cam2world, X_cam) + t_cam2world[None, None, :]
+
+    return X_world, valid_mask
 
 
 class ObjaverseDataset(Dataset):
@@ -66,14 +144,17 @@ class ObjaverseDataset(Dataset):
         #         self.items.append(line.strip())
         # self.items = uids
 
-        if self.training:
-            local_views_path_json = self.opt.local_views_path_json
-        else:
-            local_views_path_json = self.opt.eval_views_path_json
+        # if self.training:
+        #     local_views_path_json = self.opt.local_views_path_json
+        # else:
+        #     local_views_path_json = self.opt.eval_views_path_json
+        
+        local_views_path_json = self.opt.local_views_path_json
+
         with open(local_views_path_json, 'r') as f:
             local_views = json.load(f)
         self.items = local_views
-        if len(self.items) < 1000 and self.training:
+        if len(self.items) < 2000 and self.training:
             self.items = self.items * (1000 // len(self.items))
 
         # local_models_path_json = self.opt.local_models_path_json
@@ -113,6 +194,9 @@ class ObjaverseDataset(Dataset):
         self.proj_matrix[3, 2] = - (self.opt.zfar * self.opt.znear) / (self.opt.zfar - self.opt.znear)
         self.proj_matrix[2, 3] = 1        
 
+        # camera parameters
+        self.camera_params = OrbitCamera(self.opt.input_size, self.opt.input_size, r=1.5, fovy=67.38)
+        self.intrinsics = torch.from_numpy(self.camera_params.intrinsics) # np.array([focal, focal, self.W // 2, self.H // 2], dtype=np.float32)
 
     def __len__(self):
         return len(self.items)
@@ -168,6 +252,20 @@ class ObjaverseDataset(Dataset):
         point_positions_tensor = normalize_point_cloud(point_positions_tensor, 2.0)
         return point_positions_tensor
 
+    def load_depth(self, depth_path):
+        dep_img = cv2.imread(depth_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+        if dep_img is None:
+            print(f'[WARN] failed to load depth image {depth_path}')
+        dep_img[dep_img > 100] = 0
+        if dep_img.max() - dep_img.min() == 0:
+            dep_img = np.zeros_like(dep_img)
+        else:
+            dep_img = (dep_img - dep_img.min())/(dep_img.max() - dep_img.min())
+        dep_img = dep_img[:, :, 0:1]
+
+        dep_img = torch.from_numpy(dep_img).permute(2, 0, 1).contiguous().float()
+        return dep_img
+
     def __getitem__(self, idx):
 
         uid = self.items[idx]
@@ -177,6 +275,7 @@ class ObjaverseDataset(Dataset):
         images = []
         masks = []
         cam_poses = []
+        depths = []
         
         vid_cnt = 0
 
@@ -199,11 +298,27 @@ class ObjaverseDataset(Dataset):
 
         bkg_color = [1.0, 1.0, 1.0]
 
+        # load intrinsics
+        intrinsics_path = os.path.join(uid, f'intrinsics.npy')
+        intrinsics_np = np.load(intrinsics_path)
+
+        intrinsics = torch.zeros(3, 3)
+        intrinsics[0, 0] = intrinsics_np[0][0] # self.intrinsics[0]
+        intrinsics[1, 1] = intrinsics_np[0][1] # self.intrinsics[1]
+        intrinsics[0, 2] = intrinsics_np[1][0] # self.intrinsics[2]
+        intrinsics[1, 2] = intrinsics_np[1][1] # self.intrinsics[3]
+        intrinsics[2, 2] = 1
+
+        depth_path_list = []
+
         for vid in vids:
 
             image_path = os.path.join(uid, 'rgba', f'{vid:03d}.png')
             camera_path = os.path.join(uid, 'pose', f'{vid:03d}.npy')
-
+            if self.opt.use_depth:
+                depth_path = os.path.join(uid, 'depth', f'{vid:03d}_depth0001.exr')
+                depth_path_list.append(depth_path)
+                depth_img = self.load_depth(depth_path)
             try:
                 # TODO: load data (modify self.client here)
                 # image = np.frombuffer(self.client.get(image_path), np.uint8)
@@ -240,16 +355,36 @@ class ObjaverseDataset(Dataset):
 
             # scale up radius to fully use the [-1, 1]^3 space!
             # c2w[:3, 3] *= self.opt.cam_radius / 1.5 # 1.5 is the default scale
-        
-            # disabled since we already get masks
-            # image = image.permute(2, 0, 1) # [4, 512, 512]
-            # mask = image[3:4] # [1, 512, 512]
-            # image = image[:3] * mask + (1 - mask) # [3, 512, 512], to white bg
-            # image = image[[2,1,0]].contiguous() # bgr to rgb
+
+            # # depth to point cloud
+            # c2w[:3, 1:3] *= -1 # invert up & forward direction
+            
+            # img = Image.open(image_path).convert('RGB')
+            # h, w = (img.size[0], img.size[1])
+            # img = np.array(img)
+            # rgb_image = img
+
+            # resolution = [h, w] # [320, 320]
+            # depthmap_origin = depth_img.numpy()[0]
+            # # rgb_image, depthmap, intrinsics = crop_resize_if_necessary(
+            # #     rgb_image, depthmap_origin, intrinsics_origin, resolution
+            # # )
+
+            # pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(depthmap_origin, intrinsics_origin, c2w.numpy())
+            # # pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(depthmap, intrinsics, c2w.numpy())
+            # pts = np.concatenate([p[m] for p, m in zip(pts3d, valid_mask)])
+            # col = np.concatenate([p[m] for p, m in zip(img, valid_mask)])
+
+            # pts = normalize_point_cloud(pts.reshape(-1, 3), 2.0)
+            # col = col.reshape(-1, 3)
+            # pts_list.append(pts)
+            # col_list.append(col)
 
             images.append(image)
             masks.append(alpha.squeeze(0))
             cam_poses.append(c2w)
+            if self.opt.use_depth:
+                depths.append(depth_img)
 
             vid_cnt += 1
             if vid_cnt == self.opt.num_views:
@@ -265,7 +400,21 @@ class ObjaverseDataset(Dataset):
         images = torch.stack(images, dim=0) # [V, C, H, W]
         masks = torch.stack(masks, dim=0) # [V, H, W]
         cam_poses = torch.stack(cam_poses, dim=0) # [V, 4, 4]
+        if self.opt.use_depth:
+            depths = torch.stack(depths, dim=0) # [V, 4, 4]
+        # # export point cloud
+        # pts = np.concatenate(pts_list)
+        # col = np.concatenate(col_list)
 
+        # pct = trimesh.PointCloud(pts, colors=col)
+        # pct = trimesh.PointCloud(pts, colors=col.reshape(-1, 3))
+        # pct = trimesh.PointCloud(pts.reshape(-1, 3), colors=col.reshape(-1, 3))
+        # pct = trimesh.PointCloud(pts.reshape(-1, 3))
+
+        # # Save to a PLY file
+        # print('saving to local file.')
+        # pct.export('point_cloud.ply')
+        # print('saving to local file done.')
         # normalized camera feats as in paper (transform the first pose to a fixed position)
         # transform = torch.tensor([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, self.opt.cam_radius], [0, 0, 0, 1]], dtype=torch.float32) @ torch.inverse(cam_poses[1])
         # cam_poses = transform.unsqueeze(0) @ cam_poses  # [V, 4, 4]
@@ -295,6 +444,8 @@ class ObjaverseDataset(Dataset):
         images_input = TF.normalize(images_input, IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
 
         # resize render ground-truth images, range still in [0, 1]
+        if self.opt.use_depth:
+            results['depths_output'] = F.interpolate(depths, size=(self.opt.output_size, self.opt.output_size), mode='bilinear', align_corners=False) # [V, C, output_size, output_size]
         results['images_output'] = F.interpolate(images, size=(self.opt.output_size, self.opt.output_size), mode='bilinear', align_corners=False) # [V, C, output_size, output_size]
         results['masks_output'] = F.interpolate(masks.unsqueeze(1), size=(self.opt.output_size, self.opt.output_size), mode='bilinear', align_corners=False) # [V, 1, output_size, output_size]
 
@@ -318,6 +469,14 @@ class ObjaverseDataset(Dataset):
         cam_view_proj = cam_view @ self.proj_matrix # [V, 4, 4]
         cam_pos = - cam_poses[:, :3, 3] # [V, 3]
         
+        intrinsics = torch.zeros(3, 3)
+        intrinsics[0, 0] = self.intrinsics[0]
+        intrinsics[1, 1] = self.intrinsics[1]
+        intrinsics[0, 2] = self.intrinsics[2]
+        intrinsics[2, 2] = self.intrinsics[3]
+        results['intrinsics'] = intrinsics.unsqueeze(0).repeat(self.opt.num_views, 1, 1)
+        results['extrinsics'] = cam_poses
+
         results['cam_view'] = cam_view
         results['cam_view_proj'] = cam_view_proj
         results['cam_pos'] = cam_pos

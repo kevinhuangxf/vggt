@@ -127,6 +127,9 @@ class GSHead(DPTHead):
 
         num_input_views = 4
         out = out.reshape(B, num_input_views, 14, int(patch_h * self.patch_size / self.down_ratio), int(patch_w * self.patch_size / self.down_ratio)) # b, 4, 14, 64, 64
+        
+        raw_out = out
+        
         out = out.permute(0, 1, 3, 4, 2).reshape(B, -1, 14) # B, 16384, 14
         pos = self.pos_act(out[..., 0:3]) # [B, N, 3]
         opacity = self.opacity_act(out[..., 3:4])
@@ -135,4 +138,4 @@ class GSHead(DPTHead):
         rgbs = self.rgb_act(out[..., 11:])
         gaussians = torch.cat([pos, opacity, scale, rotation, rgbs], dim=-1) # [B, N, 14]
         
-        return gaussians
+        return gaussians, raw_out

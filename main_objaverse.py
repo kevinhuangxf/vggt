@@ -10,6 +10,7 @@ from accelerate import DistributedDataParallelKwargs
 from accelerate import Accelerator, DistributedDataParallelKwargs
 
 from kiui.lpips import LPIPS
+from vggt.models.vggt import VGGT
 from vggt.models.vggt_cam_gs import VGGT_CAM_GS
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
@@ -19,6 +20,13 @@ ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 # accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
 
+import trimesh
+
+import os
+# # 设置 master_port
+# os.environ['MASTER_ADDR'] = '127.0.0.1'
+# os.environ['MASTER_PORT'] = '29500'
+
 minmax_norm = lambda x: (x - x.min()) / (x.max() - x.min())
 
 class GaussianRendererWrapper:
@@ -27,11 +35,109 @@ class GaussianRendererWrapper:
         self.gs = GaussianRenderer(opt)
         self.opt = opt
         self.model = model
+        # self.vggt = VGGT.from_pretrained("facebook/VGGT-1B").cuda()
 
         # LPIPS loss
         if self.opt.lambda_lpips > 0:
             self.lpips_loss = LPIPS(net='vgg').cuda()
             self.lpips_loss.requires_grad_(False)
+
+        # activations...
+        self.pos_act = lambda x: x.clamp(-1, 1)
+        self.scale_act = lambda x: 0.1 * F.softplus(x)
+        self.opacity_act = lambda x: torch.sigmoid(x)
+        self.rot_act = lambda x: F.normalize(x, dim=-1)
+        self.rgb_act = lambda x: 0.5 * torch.tanh(x) + 0.5 # NOTE: may use sigmoid if train again
+
+    def depthmap_to_absolute_camera_coordinates(self, depthmaps, camera_intrinsics, camera_poses, **kw):
+        """
+        Args:
+            - depthmaps (BxHxW tensor): Batch of depth maps
+            - camera_intrinsics: a 3x3 matrix
+            - camera_poses: a batch of 4x3 or 4x4 cam2world matrices (Bx4x4 or Bx4x3)
+        Returns:
+            pointmap of absolute coordinates (BxHxWx3 tensor), and a mask specifying valid pixels.
+        """
+
+        def depthmap_to_camera_coordinates(depthmaps, camera_intrinsics, pseudo_focal=None):
+            """
+            Args:
+                - depthmaps (BxHxW tensor): Batch of depth maps
+                - camera_intrinsics: a 3x3 matrix
+            Returns:
+                pointmap of absolute coordinates (BxHxWx3 tensor), and a mask specifying valid pixels.
+            """
+            camera_intrinsics = torch.tensor(camera_intrinsics, dtype=torch.float32)
+            B, H, W = depthmaps.shape
+
+            # Compute 3D ray associated with each pixel
+            # Strong assumption: there are no skew terms
+            assert camera_intrinsics[0, 1] == 0.0
+            assert camera_intrinsics[1, 0] == 0.0
+            if pseudo_focal is None:
+                fu = camera_intrinsics[0, 0]
+                fv = camera_intrinsics[1, 1]
+            else:
+                assert pseudo_focal.shape == (H, W)
+                fu = fv = pseudo_focal
+            cu = camera_intrinsics[0, 2]
+            cv = camera_intrinsics[1, 2]
+            device = camera_intrinsics.device
+
+            u, v = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
+            u = u.unsqueeze(0).expand(B, -1, -1)
+            v = v.unsqueeze(0).expand(B, -1, -1)
+            z_cam = depthmaps
+            x_cam = (u - cu) * z_cam / fu
+            y_cam = (v - cv) * z_cam / fv
+            X_cam = torch.stack((x_cam, y_cam, z_cam), dim=-1).to(torch.float32)
+
+            # Mask for valid coordinates
+            valid_mask = (depthmaps > 0.0)
+            return X_cam, valid_mask
+
+        X_cam, valid_mask = depthmap_to_camera_coordinates(depthmaps, camera_intrinsics)
+
+        B, H, W, _ = X_cam.shape
+        R_cam2world = camera_poses[:, :3, :3]
+        t_cam2world = camera_poses[:, :3, 3]
+
+        # print("R_cam2world: ", R_cam2world.shape)
+        # print("X_cam: ", X_cam.shape)
+
+        # Express in absolute coordinates (invalid depth values)
+        X_world = torch.einsum("bij,bhwj->bhwi", R_cam2world, X_cam) + t_cam2world[:, None, None, :]
+        return X_world
+
+    def normalize_point_cloud(self, point_clouds, box_scale):
+        """
+        Args:
+            - point_clouds (BxNx3 tensor): Batch of point clouds
+            - box_scale (float): Scale factor for normalization
+        Returns:
+            - normalized_point_clouds (BxNx3 tensor): Normalized point clouds
+        """
+        # Compute the bounding box for each point cloud
+        bbox_min = torch.min(point_clouds, dim=1, keepdim=True).values
+        bbox_max = torch.max(point_clouds, dim=1, keepdim=True).values
+
+        # Compute the scale factor
+        scale = box_scale / torch.max(bbox_max - bbox_min, dim=2, keepdim=True).values
+
+        # Scale the point clouds
+        point_clouds = point_clouds * scale
+
+        # Recompute the bounding box
+        bbox_min = torch.min(point_clouds, dim=1, keepdim=True).values
+        bbox_max = torch.max(point_clouds, dim=1, keepdim=True).values
+
+        # Compute the offset
+        offset = -(bbox_min + bbox_max) / 2
+
+        # Translate the point clouds
+        normalized_point_clouds = point_clouds + offset
+
+        return normalized_point_clouds
 
     def render_gs(self, data):
         results = {}
@@ -41,11 +147,40 @@ class GaussianRendererWrapper:
         
         images = data['input'][:, :, :3, ...] # [B, 4, 9, h, W], input features
         B, V, C, H, W = images.shape
+
+        masks_input = data['masks_output'][:, :4, ...]
+        masks_input = (masks_input > 0.5).float().permute(0, 1, 3, 4, 2).reshape(B, -1, 1)
+
+        depth_input = data['depths_output'][:, :4, ...]
+
         # images = images.view(B*V, C, H, W) # [B*V, 9, h, W], flatten the batch and view dimensions
         # gaussians = self.forward_gaussians(images) # [B, N, 14]
         # images = images[None]  # Add batch dimension
-        aggregated_tokens_list, ps_idx = self.model.aggregator(images)
-        gaussians = self.model.gs_head(aggregated_tokens_list, images, ps_idx)
+        aggregated_tokens_list, ps_idx = self.model.module.aggregator(images)
+        gaussians, raw_out = self.model.module.gs_head(aggregated_tokens_list, images, ps_idx)
+        # gs_out = gs_out.reshape(B, self.opt.num_input_views, 14, H, W) # b, 4, 14, 64, 64
+        # gs_out = gs_out.permute(0, 1, 3, 4, 2).reshape(B, -1, 14) # B, 16384, 14
+
+        # pose = data['extrinsics'][:, :self.opt.num_input_views]
+        # pose = pose.reshape(B*V, 4, 4)
+        # # depth_map, depth_conf = self.model.module.depth_head(aggregated_tokens_list, images, ps_idx)
+        # pts = self.depthmap_to_absolute_camera_coordinates(depth_input.view(B*V, H, W, 1)[..., 0], data['intrinsics'][0][0], pose)
+        # pts = self.normalize_point_cloud(pts.reshape(B*V, -1, 3), 2.0).reshape(B, -1, 3)
+
+        # point_map, point_conf  = self.vggt.point_head(aggregated_tokens_list, images, ps_idx)
+        # pts = self.normalize_point_cloud(point_map.reshape(B, -1, 3), 2.0).reshape(B, -1, 3)
+
+        # gs_out[:, :, :3] = pts # gs_out[:, :, :3] * 0.5
+        # gs_out[:, :, 3:4] = masks_input
+        # gs_out[:, :, 11:] = images.permute(0, 1, 3, 4, 2).reshape(B, -1, 3)
+
+        # pos = self.pos_act(gs_out[..., 0:3]) # [B, N, 3]
+        # opacity = self.opacity_act(gs_out[..., 3:4])
+        # scale = self.scale_act(gs_out[..., 4:7])
+        # rotation = self.rot_act(gs_out[..., 7:11])
+        # rgbs = self.rgb_act(gs_out[..., 11:])
+        # gaussians = torch.cat([pos, opacity, scale, rotation, rgbs], dim=-1) # [B, N, 14]
+
 
         bg_color = torch.ones(3, dtype=torch.float32, device=gaussians.device) 
         gs_results = self.gs.render(gaussians, data['cam_view'], data['cam_view_proj'], data['cam_pos'], bg_color=bg_color) # [B, V, C, output_size, output_size]
@@ -210,33 +345,33 @@ def main():
                     # Concatenate pred_images and gt_images vertically
                     images_combined = np.concatenate((gt_images, pred_images), axis=0)
                     
-                    if opt.use_depth:
-                        gt_depths = data['depths_output'].detach().cpu().numpy() # [B, V, 3, output_size, output_size]
-                        gt_depths = gt_depths.transpose(0, 3, 1, 4, 2).reshape(-1, gt_depths.shape[1] * gt_depths.shape[3], 1) # [B*output_size, V*output_size, 1]
-                        gt_depths = np.repeat(gt_depths, repeats=3, axis=-1) # [B*output_size, V*output_size, 3]
+                    # if opt.use_depth:
+                    #     gt_depths = data['depths_output'].detach().cpu().numpy() # [B, V, 3, output_size, output_size]
+                    #     gt_depths = gt_depths.transpose(0, 3, 1, 4, 2).reshape(-1, gt_depths.shape[1] * gt_depths.shape[3], 1) # [B*output_size, V*output_size, 1]
+                    #     gt_depths = np.repeat(gt_depths, repeats=3, axis=-1) # [B*output_size, V*output_size, 3]
 
-                        pred_depths = out['depths_pred'].detach().cpu().numpy() # [B, V, 1, output_size, output_size]
-                        pred_depths = pred_depths.transpose(0, 3, 1, 4, 2)
-                        pred_depths = pred_depths.reshape(opt.output_size * opt.batch_size, opt.output_size * opt.num_views, 1)
-                        pred_depths = np.repeat(pred_depths, repeats=3, axis=-1)
+                    #     pred_depths = out['depths_pred'].detach().cpu().numpy() # [B, V, 1, output_size, output_size]
+                    #     pred_depths = pred_depths.transpose(0, 3, 1, 4, 2)
+                    #     pred_depths = pred_depths.reshape(opt.output_size * opt.batch_size, opt.output_size * opt.num_views, 1)
+                    #     pred_depths = np.repeat(pred_depths, repeats=3, axis=-1)
 
-                        # depths_mast3r = out['depths_mast3r'].detach().cpu().numpy() # [B, V, 1, output_size, output_size]
-                        # depths_mast3r = depths_mast3r.transpose(0, 3, 1, 4, 2)
-                        # depths_mast3r = depths_mast3r.reshape(opt.output_size * opt.batch_size, opt.output_size * opt.num_input_views, 1)
-                        # depths_mast3r = np.repeat(depths_mast3r, repeats=3, axis=-1)
+                    #     # depths_mast3r = out['depths_mast3r'].detach().cpu().numpy() # [B, V, 1, output_size, output_size]
+                    #     # depths_mast3r = depths_mast3r.transpose(0, 3, 1, 4, 2)
+                    #     # depths_mast3r = depths_mast3r.reshape(opt.output_size * opt.batch_size, opt.output_size * opt.num_input_views, 1)
+                    #     # depths_mast3r = np.repeat(depths_mast3r, repeats=3, axis=-1)
 
-                        # pred_depths = np.concatenate((pred_depths, pred_depths), axis=1)
-                        # pred_depths = np.concatenate((pred_depths, depths_mast3r), axis=1)
+                    #     # pred_depths = np.concatenate((pred_depths, pred_depths), axis=1)
+                    #     # pred_depths = np.concatenate((pred_depths, depths_mast3r), axis=1)
                         
-                        # print(images_combined.shape, gt_depths.shape, pred_depths.shape)
-                        images_combined = np.concatenate((images_combined, gt_depths, pred_depths), axis=0)
+                    #     # print(images_combined.shape, gt_depths.shape, pred_depths.shape)
+                    #     images_combined = np.concatenate((images_combined, gt_depths, pred_depths), axis=0)
 
-                        depth_mast3r = out['depths_mast3r'].detach().cpu().numpy()
-                        depth_mast3r = depth_mast3r.transpose(1, 0, 2)
-                        depth_mast3r = depth_mast3r.reshape(opt.output_size * opt.batch_size, opt.output_size * opt.num_input_views, 1)
-                        depth_mast3r = np.repeat(depth_mast3r, repeats=3, axis=-1)
-                        depth_mast3r = np.concatenate((depth_mast3r, depth_mast3r), axis=1)
-                        images_combined = np.concatenate((images_combined, depth_mast3r), axis=0)
+                    #     depth_mast3r = out['depths_mast3r'].detach().cpu().numpy()
+                    #     depth_mast3r = depth_mast3r.transpose(1, 0, 2)
+                    #     depth_mast3r = depth_mast3r.reshape(opt.output_size * opt.batch_size, opt.output_size * opt.num_input_views, 1)
+                    #     depth_mast3r = np.repeat(depth_mast3r, repeats=3, axis=-1)
+                    #     depth_mast3r = np.concatenate((depth_mast3r, depth_mast3r), axis=1)
+                    #     images_combined = np.concatenate((images_combined, depth_mast3r), axis=0)
                     
                     kiui.write_image(f'{opt.workspace}/train_pred_gt_images_{epoch}_{i}.jpg', images_combined)
                     # kiui.write_image(f'{opt.workspace}/train_pred_images_{epoch}_{i}.jpg', pred_images)
@@ -260,87 +395,87 @@ def main():
 
         torch.cuda.empty_cache()
 
-        # eval
-        with torch.no_grad():
-            model.eval()
-            total_psnr = 0
-            total_ssim = 0
-            total_lpips = 0
-            for i, data in enumerate(test_dataloader):
+        # # eval
+        # with torch.no_grad():
+        #     model.eval()
+        #     total_psnr = 0
+        #     total_ssim = 0
+        #     total_lpips = 0
+        #     for i, data in enumerate(test_dataloader):
 
-                out = model(data)
+        #         out = model(data)
     
-                psnr = out['psnr']
-                total_psnr += psnr.detach()
-                # ssim = out['ssim']
-                # total_ssim += ssim.detach()
-                lpips = out['lpips']
-                total_lpips += lpips.detach()
+        #         psnr = out['psnr']
+        #         total_psnr += psnr.detach()
+        #         # ssim = out['ssim']
+        #         # total_ssim += ssim.detach()
+        #         lpips = out['lpips']
+        #         total_lpips += lpips.detach()
                 
-                # save some images
-                if accelerator.is_main_process:
-                    gt_images = data['images_output'].detach().cpu().numpy() # [B, V, 3, output_size, output_size]
-                    gt_images = gt_images.transpose(0, 3, 1, 4, 2).reshape(-1, gt_images.shape[1] * gt_images.shape[3], 3) # [B*output_size, V*output_size, 3]
-                    kiui.write_image(f'{opt.workspace}/eval_gt_images_{epoch}_{i}.jpg', gt_images)
+        #         # save some images
+        #         if accelerator.is_main_process:
+        #             gt_images = data['images_output'].detach().cpu().numpy() # [B, V, 3, output_size, output_size]
+        #             gt_images = gt_images.transpose(0, 3, 1, 4, 2).reshape(-1, gt_images.shape[1] * gt_images.shape[3], 3) # [B*output_size, V*output_size, 3]
+        #             kiui.write_image(f'{opt.workspace}/eval_gt_images_{epoch}_{i}.jpg', gt_images)
 
-                    pred_images = out['images_pred'].detach().cpu().numpy() # [B, V, 3, output_size, output_size]
-                    pred_images = pred_images.transpose(0, 3, 1, 4, 2).reshape(-1, pred_images.shape[1] * pred_images.shape[3], 3)
-                    kiui.write_image(f'{opt.workspace}/eval_pred_images_{epoch}_{i}.jpg', pred_images)
+        #             pred_images = out['images_pred'].detach().cpu().numpy() # [B, V, 3, output_size, output_size]
+        #             pred_images = pred_images.transpose(0, 3, 1, 4, 2).reshape(-1, pred_images.shape[1] * pred_images.shape[3], 3)
+        #             kiui.write_image(f'{opt.workspace}/eval_pred_images_{epoch}_{i}.jpg', pred_images)
 
-                    # pred_alphas = out['alphas_pred'].detach().cpu().numpy() # [B, V, 1, output_size, output_size]
-                    # pred_alphas = pred_alphas.transpose(0, 3, 1, 4, 2).reshape(-1, pred_alphas.shape[1] * pred_alphas.shape[3], 1)
-                    # kiui.write_image(f'{opt.workspace}/eval_pred_alphas_{epoch}_{i}.jpg', pred_alphas)
+        #             # pred_alphas = out['alphas_pred'].detach().cpu().numpy() # [B, V, 1, output_size, output_size]
+        #             # pred_alphas = pred_alphas.transpose(0, 3, 1, 4, 2).reshape(-1, pred_alphas.shape[1] * pred_alphas.shape[3], 1)
+        #             # kiui.write_image(f'{opt.workspace}/eval_pred_alphas_{epoch}_{i}.jpg', pred_alphas)
 
-                    # Concatenate pred_images and gt_images vertically
-                    images_combined = np.concatenate((gt_images, pred_images), axis=0)
+        #             # Concatenate pred_images and gt_images vertically
+        #             images_combined = np.concatenate((gt_images, pred_images), axis=0)
 
-                    if opt.use_depth:
-                        gt_depths = data['depths_output'].detach().cpu().numpy() # [B, V, 3, output_size, output_size]
-                        gt_depths = gt_depths.transpose(0, 3, 1, 4, 2).reshape(-1, gt_depths.shape[1] * gt_depths.shape[3], 1) # [B*output_size, V*output_size, 1]
-                        gt_depths = np.repeat(gt_depths, repeats=3, axis=-1) # [B*output_size, V*output_size, 3]
+        #             if opt.use_depth:
+        #                 gt_depths = data['depths_output'].detach().cpu().numpy() # [B, V, 3, output_size, output_size]
+        #                 gt_depths = gt_depths.transpose(0, 3, 1, 4, 2).reshape(-1, gt_depths.shape[1] * gt_depths.shape[3], 1) # [B*output_size, V*output_size, 1]
+        #                 gt_depths = np.repeat(gt_depths, repeats=3, axis=-1) # [B*output_size, V*output_size, 3]
 
-                        gt_masks = data['masks_output'].detach().cpu().numpy() # [B, V, 3, output_size, output_size]
-                        gt_masks = gt_masks.transpose(0, 3, 1, 4, 2).reshape(-1, gt_masks.shape[1] * gt_masks.shape[3], 1) # [B*output_size, V*output_size, 1]
-                        gt_masks = np.repeat(gt_masks, repeats=3, axis=-1) # [B*output_size, V*output_size, 3]
+        #                 gt_masks = data['masks_output'].detach().cpu().numpy() # [B, V, 3, output_size, output_size]
+        #                 gt_masks = gt_masks.transpose(0, 3, 1, 4, 2).reshape(-1, gt_masks.shape[1] * gt_masks.shape[3], 1) # [B*output_size, V*output_size, 1]
+        #                 gt_masks = np.repeat(gt_masks, repeats=3, axis=-1) # [B*output_size, V*output_size, 3]
 
-                        pred_depths = out['depths_pred'].detach().cpu().numpy() # [B, V, 1, output_size, output_size]
-                        pred_depths = pred_depths.transpose(0, 3, 1, 4, 2).reshape(-1, pred_depths.shape[1] * pred_depths.shape[3], 1) # [B*output_size, V*output_size, 1]
-                        # pred_depths = pred_depths.transpose(0, 3, 1, 4, 2)
-                        # pred_depths = pred_depths.reshape(opt.output_size * opt.batch_size, opt.output_size * opt.num_input_views, 1)
-                        pred_depths = np.repeat(pred_depths, repeats=3, axis=-1)
+        #                 pred_depths = out['depths_pred'].detach().cpu().numpy() # [B, V, 1, output_size, output_size]
+        #                 pred_depths = pred_depths.transpose(0, 3, 1, 4, 2).reshape(-1, pred_depths.shape[1] * pred_depths.shape[3], 1) # [B*output_size, V*output_size, 1]
+        #                 # pred_depths = pred_depths.transpose(0, 3, 1, 4, 2)
+        #                 # pred_depths = pred_depths.reshape(opt.output_size * opt.batch_size, opt.output_size * opt.num_input_views, 1)
+        #                 pred_depths = np.repeat(pred_depths, repeats=3, axis=-1)
 
-                        # print(gt_depths.shape, pred_depths.shape)
-                        # depth_errs = compute_errors(gt_depths, pred_depths, gt_masks)
-                        # print("gt pred depth_errs: ", depth_errs)
+        #                 # print(gt_depths.shape, pred_depths.shape)
+        #                 # depth_errs = compute_errors(gt_depths, pred_depths, gt_masks)
+        #                 # print("gt pred depth_errs: ", depth_errs)
 
-                        # depths_mast3r = out['depths_mast3r'].detach().cpu().numpy() # [B, V, 1, output_size, output_size]
-                        # depths_mast3r = depths_mast3r.transpose(0, 3, 1, 4, 2)
-                        # depths_mast3r = np.concatenate((depths_mast3r[:, :, ::2, ...], depths_mast3r[:, :, 1::2, ...]), axis=2)
-                        # depths_mast3r = depths_mast3r.reshape(opt.output_size * opt.batch_size, opt.output_size * opt.num_input_views, 1)
-                        # depths_mast3r = np.repeat(depths_mast3r, repeats=3, axis=-1)
-                        # depths_mast3r_zeropad = np.zeros_like(pred_depths)
-                        # depths_mast3r_zeropad[:, :depths_mast3r.shape[1]] = depths_mast3r
+        #                 # depths_mast3r = out['depths_mast3r'].detach().cpu().numpy() # [B, V, 1, output_size, output_size]
+        #                 # depths_mast3r = depths_mast3r.transpose(0, 3, 1, 4, 2)
+        #                 # depths_mast3r = np.concatenate((depths_mast3r[:, :, ::2, ...], depths_mast3r[:, :, 1::2, ...]), axis=2)
+        #                 # depths_mast3r = depths_mast3r.reshape(opt.output_size * opt.batch_size, opt.output_size * opt.num_input_views, 1)
+        #                 # depths_mast3r = np.repeat(depths_mast3r, repeats=3, axis=-1)
+        #                 # depths_mast3r_zeropad = np.zeros_like(pred_depths)
+        #                 # depths_mast3r_zeropad[:, :depths_mast3r.shape[1]] = depths_mast3r
 
-                        # depth_errs = compute_errors(gt_depths[0], pred_depths[0])
-                        # print("gt pred depth_errs: ", depth_errs)
+        #                 # depth_errs = compute_errors(gt_depths[0], pred_depths[0])
+        #                 # print("gt pred depth_errs: ", depth_errs)
 
-                        # pred_depths = np.concatenate((depths_mast3r, pred_depths), axis=1)
-                        # pred_depths = np.concatenate((pred_depths, depths_mast3r), axis=1)
+        #                 # pred_depths = np.concatenate((depths_mast3r, pred_depths), axis=1)
+        #                 # pred_depths = np.concatenate((pred_depths, depths_mast3r), axis=1)
                         
-                        # images_combined = np.concatenate((images_combined, gt_depths, pred_depths, depths_mast3r_zeropad), axis=0)
-                        images_combined = np.concatenate((images_combined, gt_depths, pred_depths), axis=0)
-                        kiui.write_image(f'{opt.workspace}/images_combined_{epoch}_{i}.jpg', images_combined)                                        
+        #                 # images_combined = np.concatenate((images_combined, gt_depths, pred_depths, depths_mast3r_zeropad), axis=0)
+        #                 images_combined = np.concatenate((images_combined, gt_depths, pred_depths), axis=0)
+        #                 kiui.write_image(f'{opt.workspace}/images_combined_{epoch}_{i}.jpg', images_combined)                                        
 
-            torch.cuda.empty_cache()
+        #     torch.cuda.empty_cache()
 
-            total_psnr = accelerator.gather_for_metrics(total_psnr).mean()
-            if accelerator.is_main_process:
-                total_psnr /= len(test_dataloader)
-                accelerator.print(f"[eval] epoch: {epoch} psnr: {psnr:.4f}")
-                # total_ssim /= len(test_dataloader)
-                # accelerator.print(f"[eval] epoch: {epoch} ssim: {ssim:.4f}")
-                total_lpips /= len(test_dataloader)
-                accelerator.print(f"[eval] epoch: {epoch} lpips: {lpips:.4f}")
+        #     total_psnr = accelerator.gather_for_metrics(total_psnr).mean()
+        #     if accelerator.is_main_process:
+        #         total_psnr /= len(test_dataloader)
+        #         accelerator.print(f"[eval] epoch: {epoch} psnr: {psnr:.4f}")
+        #         # total_ssim /= len(test_dataloader)
+        #         # accelerator.print(f"[eval] epoch: {epoch} ssim: {ssim:.4f}")
+        #         total_lpips /= len(test_dataloader)
+        #         accelerator.print(f"[eval] epoch: {epoch} lpips: {lpips:.4f}")
 
 
 
